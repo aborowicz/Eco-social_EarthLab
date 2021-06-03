@@ -1,0 +1,688 @@
+---
+title: "FurSeals"
+author: "A. Borowicz"
+date: "2/24/2021"
+output: html_document
+---
+## Introduction
+
+In this example, we're going to try to see how several distinct datasets agree. We'll use the Antarctic fur seal as our species of interest here. This is a species that's very well-studied at a couple of breeding colonies, but whose distribution across the region is very poorly understood. This is a problem since a dramatic recovery of this species after intensive hunting means they are quite abundant, and are therefore likely an important predator. Resource managers trying to set catch limits for Antarctic krill, and conservationists trying to understand the drivers of population change in species like chinstrap penguins, need to be able to account for competition among species. Currently our models either ignore fur seals, or else make wide and poorly-informed assumptions about their use of the region.
+
+We're going to bring in three datasets here. Our goal is to get some insight into the use of the Antarctic Peninsula by this species, but also to see whether traditional surveys and opportunistic or unintentional data collection by Antarctic tourists can give us similar information. Surveying in Antarctica is difficult and expensive. But there are thousands of toursits coming to the region each year, taking a lot of photographs. If we can find their photographs, the images that include seals can give us information about the spatial and temporal distribution of the species.
+
+For the survey data, we'll rely on the Antarctic Site Inventory, a project of the NGO Oceanites. This is primarily a penguin census project, but site visits also record the presence of seals.
+
+For the tourist data, we'll use images we've scraped from Flickr and then classified to species using deep learning (details in Borowicz et al. 2021 - Social Sensors for Wildlife: Ecological opportunities in the era of camera ubiquity https://www.frontiersin.org/articles/10.3389/fmars.2021.645288). I've included the project scripts from that paper in this repository as well. The Flickr data used here are a byproduct of that project, which collected any image associated with the word "Seal" and geotagged within the Antarctic Peninsula region.
+
+Plus records from iNaturalist, a community science app. These are also presence records, as observations of fur seals from users. We use only observations that are "Research Grade," that is, observations in which 2/3 of the identifications associated with an observation agree that it is an Antarctic fur seal, and that there are at least 2 identifications.
+
+To get started, we'll load packages:
+
+```{r Load Libraries, warning=FALSE, error=FALSE, message=FALSE}
+
+library(data.table)
+library(lubridate)
+library(plyr)
+library(dplyr)
+library(MASS)
+library(ggplot2)
+library(gridExtra)
+library(boot)
+library(cowplot)
+library(musculusColors)
+library(wesanderson)
+library(MuMIn)
+library(tidyr)
+library(MCMCvis)
+library(reshape)
+library(bayesplot)
+library(rstanarm)
+library(tidybayes)
+library(modelr)
+
+# Plus a function to help us plot
+# extract legend, to share among plots
+# https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs,
+                      function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+```
+
+
+
+We'll bring in a few extra data sources that help us interpret those data. In particular, a list of sites referenced in the ASI dataset with their latitude and longitude.
+
+
+```{r Load data sources}
+# ASI data
+dat<-read.csv("./data/ASI_FurSeal_dat.csv")
+
+# To fill in some gaps
+missing_regions<-read.csv("./data/missing_site_regions.csv")
+
+# Data from Flickr, from Borowicz et al. 2021
+webcrawl.dat<-read.csv("./data/Original_WebCrawl_Borowiczetal_202X.csv")
+
+# ASI sites
+sites<-read.csv("./data/ASI_sites.csv")
+
+# iNaturalist data
+all_inat<-read.delim("./data/GBIF All iNat Records from Antarctica/0198044-200613084148143/0198044-200613084148143.csv")
+
+```
+
+Once we have data, we need to do some data wrangling. We want to do a few things:
+
+- We'll combine our different ASI datasets into one
+- We'll add a column that says whether there was or wasn't a fur seal
+- We'll parse the date into a machine-readable format
+- We'll create some date derivatives, like year, day of the year, month so we can access it easily
+- We'll combine the site name with site code, so we can reference it easily
+
+For Flickr data we'll do similar things:
+- Parse the date
+- Add a fur seal presence column
+
+```{r Wrangle data}
+## Data wrangling
+#We're going to start adding some new columns to dat.
+#First, summarize as 0 or 1 whether any fur seals were present, based on the coding "FS" in the species column
+#Then, we transform the date into several forms. We'll turn the Date column into Date objects for R, and we'll
+#make a new column that's just the Year
+
+#Once we have that, we combine the sites dataset with the ASI set, so that we can get the lat, long, and full name of each site present in the ASI dataset
+
+#Here we make a binary call on whether any fur seals were present
+dat$FurSeal_presence<-as.factor(dat$Species %like% "FS") 
+
+dat$Date<- ymd(parse_date_time(dat$Date, 
+                               orders=c("%m/%d/%Y", "%d-%m-%y"))) # Some fail to parse. That's because they're empty - it's okay.
+dat$Year<-year(dat$Date) # Add a field that's just the year
+dat$Day<-yday(dat$Date)  # Add a field that's day of year
+dat$Month<-month(dat$Date) # The month
+# Here we create a Week column
+dat$Week<-sapply(week(dat$Date), 
+                 FUN=function(x) ifelse(x>26,
+                                        x-52,
+                                        x))
+#Get the day since Jan 1 so we can have a plot centered on Jan 1
+dat$DaySinceJan1<-sapply(dat$Day, 
+                         FUN=function(x) ifelse(x>183,
+                                                x-365,
+                                                x)) 
+#We'll make a decimal version of the date so we can be more precise in the GLM
+dat$dec_Date<-decimal_date(dat$Date) 
+dat$MonthSinceJan1<-sapply(dat$Month, 
+                           FUN=function(x) ifelse(x>5, 
+                                                  x-12,
+                                                  x))
+# We'll add the names of the sites for convenience
+dat<-left_join(dat, 
+               sites, 
+               by=c("Site" = "name"))
+#Here we remove all non-AP data (e.g., The Falkland Islands)
+dat<-dat[which(dat$Latitude<(-59)),]
+# And fill in some missing information about location
+for(i in 1: length(missing_regions$Site)){
+  dat$Region[which(dat$Site==missing_regions$Site[i])]<-missing_regions$Region[i]
+}
+
+# We'll set a latitude bin - North and South - for plotting
+dat$LatBin<-round_any(dat$Latitude, 1) #Rounded to nearest 2nd degree here to make plotting easier
+dat$LatBin<-sapply(dat$Latitude, 
+                   FUN=function(x) ifelse(x>=(-64), 
+                                          'northern', 
+                                          'southern'))
+
+# Here we're going to infer absence for records that did not record Fur seals
+# In this case we're doing a high level pass, but this would be better handled by building in a detection model
+dat$nFurseals_Zeros<-NA
+for(i in 1:length(dat$FurSeal_presence)){
+  if(as.logical(dat$FurSeal_presence[i])==TRUE & 
+                is.na(dat$nFurSeals[i])==FALSE){
+        dat$nFurseals_Zeros[i]<-dat$nFurSeals[i]}
+  if(is.na(dat$nFurSeals[i])==TRUE & 
+          as.logical(dat$FurSeal_presence[i])==FALSE){
+                dat$nFurseals_Zeros[i]<-0}
+}
+# We have a few outliers which will cause problems later.
+# I discuss the rationale for removing them in the model section
+dat$nFurSeals_nooutliers<-sapply(dat$nFurSeals, 
+                                 FUN=function(x) ifelse(x>1000,
+                                                        1,
+                                                        x))
+dat$nFurSeals_nooutliers_Zeros<-sapply(dat$nFurseals_Zeros, 
+                                       FUN=function(x) ifelse(x>1000,
+                                                              1,
+                                                              x))
+# Because we're looking at Austral summers, I set the year to be the year
+# starting in July. That way December flows into January, rather than being in different years
+dat$Year<-sapply(dat$Date, 
+                 FUN=function(x) ifelse(month(x)>6,
+                                        year(x),
+                                        year(x)-1))   
+
+# For Flickr, we need to parse dates to machine-readable formats
+
+webcrawl.dat$Date<-as.Date(webcrawl.dat$datetime, 
+                           tryFormats=c("%Y:%m:%d %H:%M:%S"))
+webcrawl.dat$Year<-year(webcrawl.dat$Date)
+webcrawl.dat$dec_Date<-decimal_date(webcrawl.dat$Date)
+
+# And we derive a column that gives us some insight into the encounter rate for fur seals.
+webcrawl.dat$FurSeal_presence<-sapply(webcrawl.dat$image_class, 
+                                      FUN=function(x) ifelse(x=="fur",
+                                                             1,0))
+
+# Add presence to iNat dataset - every Arctocephalus becomes one, everything else is a 0
+all_inat$FurSeal_presence<-sapply(all_inat$genus, 
+                                  FUN=function(x) ifelse(x=="Arctocephalus", 
+                                                         1,0))
+# Here we add a user column so we can plot users without using their names
+unique_inat_users<-data.frame(name=unique(all_inat$rightsHolder), 
+                              number=seq(1:length(unique(all_inat$rightsHolder))))
+for(i in 1:length(all_inat$rightsHolder)){
+  all_inat$User[i]<-unique_inat_users$number[unique_inat_users$name==
+                                               all_inat$rightsHolder[i]]
+}
+```
+
+To make our lives a little easier, we're going to subset our main ASI dataset so that it only contains the records of fur seals
+
+We'll call this new_dat
+
+```{r Make new dat, echo=FALSE, include=FALSE}
+## Making a fur seal-only dataset
+#Here we'll take the full dataset, which lists the presence of any and all seal species,
+#and we'll just pull out the records where fur seals were present.
+
+#Then we translate the total time spent at a site into a decimal hour so we can add them easily
+#which(dat$WS.LS.ES %like% "FS")
+new_dat<-dat[which(dat$Species %like% "FS"),]
+new_dat$Total_time<-as.character(new_dat$Total_time)
+# Here we're going to coerce the total survey hrs to a decimal hour so we can add them later
+new_dat$Total_dec_hours<-sapply(strsplit(new_dat$Total_time, ":"), 
+  function(x) { #Fun from Joris Meys via stackoverflow
+    x <- as.numeric(x)
+    x[1]+x[2]/60
+  })
+```
+
+Finally, we'll combine our iNaturalist and Flickr datasets
+
+```{r flickr and iNat combine}
+# Make a data frame for the cit sci data (iNaturalist  and Flickr)
+
+dat$LatBin<-round_any(dat$Latitude, 1) #Rounded to nearest 2nd degree here to make plotting easier
+dat$LatBin<-sapply(dat$Latitude, 
+                   FUN=function(x) ifelse(x>=(-64), 
+                                          'northern', 
+                                          'southern'))
+citsci.dat<-data.frame(Year=all_inat$year, 
+                       Week=sapply(week(as.Date(all_inat$eventDate)), 
+                                   FUN=function(x) ifelse(x>26,
+                                                          x-52,
+                                                          x)),
+                       Latitude=all_inat$decimalLatitude,
+                       FurSeal_presence=all_inat$FurSeal_presence,
+                       LatBin=sapply(round_any(all_inat$decimalLatitude,1), 
+                                     FUN=function(x) ifelse(x>=(-64), 
+                                                            'northern', 
+                                                            'southern')))
+# Combine the two together into one dataset
+# We also exclude all data prior to 2009 here
+citsci.dat<-rbind(citsci.dat[citsci.dat$Year>=2009,],
+      data.frame(Year=webcrawl.dat$Year[is.na(webcrawl.dat$Year)==FALSE],
+                 Week=sapply(week(as.Date(webcrawl.dat$Date[is.na(webcrawl.dat$Year)==F])),
+                             FUN=function(x) ifelse(x>26,
+                                                    x-52,
+                                                    x)),
+                 Latitude=webcrawl.dat$latitude[is.na(webcrawl.dat$Year)==F],
+                 FurSeal_presence=webcrawl.dat$FurSeal_presence[is.na(webcrawl.dat$Year)==F],
+                 LatBin=sapply(round_any(webcrawl.dat$latitude[is.na(webcrawl.dat$Year)==F],1), 
+                               FUN=function(x) ifelse(x>=(-64), 
+                                                      'northern', 
+                                                      'southern'))))
+```
+
+### Historical data
+
+We're looking at fur seals in Antarctica, so it's helpful to have some context. These are the only records that exist of fur seal abundance after the sealing era of the 1820s.
+Even so, we can see the population recovery. For reference, Cape Shirreff is on Livingston Island.
+
+1900 - ~0 Seals
+1959 - 10 Seals Cape Shirreff (Liv. I.)
+1965 - 200 Seals Livingston Is.
+1970 - 200 Seals Livingston Is.
+1972 - 3000 seals Livingston Is.
+1990 - 11000 seals Cape Shirreff
+2004 - 20000 Seals Cape Shirreff
+
+
+1965 - 200 Seals Elephant Island
+1972 - 400 Seals King George Island
+1986 - 500 Seals Deception Island. (First record)
+
+## Summary Statistics
+
+We can start with some summary statistics to help us understand the ASI data:
+
+How many sites had a fur seal record?
+
+```{r Summary Statistics- ASI}
+length(unique(new_dat$Site)) # Num. of sites = 96
+```
+
+What percentage of sites that were surveyed had fur seals?
+
+```{r Summary statistics - Percent sites with FS}
+length(unique(new_dat$Site))/length(unique(dat$Site))  # 40%
+```
+
+In which years were AFS recorded?
+
+```{r Summary stats - years FS recorded}
+# Years in which fur seals recorded
+unique(new_dat$Year)
+```
+
+In how many years were AFS recorded?
+
+```{r No. of years FS recorded}
+length(unique(new_dat$Year)) # 25 years in which FS recorded
+```
+
+In all years from 1995-2020, fur seals recorded
+
+How many records of fur seals do we have?
+
+```{r summary stats No. of FS records}
+length(new_dat$Date) # 266 records
+```
+
+Some records include abundance. How many?
+
+```{r summary stats - No. with abundance}
+length(dat$nFurSeals[is.na(dat$nFurSeals)==F]) # 219 records with abund    
+```
+
+It's helpful to understand effort for both the ASI and iNaturalist data. We'll start by looking at how many observations of any sort were made in each year.
+
+```{r, ASI and iNat effort, echo=FALSE, warning=FALSE}
+ggplot(data=data.frame(Year=c(dat$Year, 
+                              all_inat$year), 
+                       Platform=factor(c(rep("ASI",
+                                             times=length(dat$Year)),
+                                         rep("iNaturalist", 
+                                             times=length(all_inat$year))))))+
+  geom_histogram(aes(x=Year, 
+                     fill=Platform), 
+                 binwidth=1, 
+                 alpha=0.5, 
+                 position="identity")+
+  theme_minimal()+
+  ggtitle("Recorded observations by source")+
+  scale_x_discrete(limits=seq(1988,2020, by=2))+
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1,5)])+
+  labs(y="Count")+
+  theme(axis.text.x = element_text(angle=-45))
+
+```
+
+What we want to understand in the broadest sense, is whether there are trends in the occurence of fur seals over time, using our different data sources. 
+We'll build a simple generalized linear model in a Bayesian framework using Stan. In this case, we're going to use the Gamma distribution. Now this is not ideal, as Gamma is a continuous distribution but we're modelling a discrete number of occurences, but Gamma handles the data better then a discrete distribution like the Negative Binomial.
+
+We're going to use a couple of simple covariates to give us insight, in particular:
+
+- Year, to see if there's change over time
+- Latitude, to see if there's a spatial trend. Latitude is useful here since the Antarctic Peninsula is a north-south landmass
+- Week, to see if there's a visible seasonal trend
+
+What we're modelling here is the encounter probability, based on the proportion of site visits during which a fur seal was recorded.
+
+Because there are some outliers - occasions in which there were an unusually high number of seals - the models perform poorly. In this case, we'll exclude them, but their presence is important. Because we're excluding them, we're considering "normal" behavior, but not modelling these edge cases. Those outliers are also clustered geographically and temporally, which is suggestive. To accomodate that, we could make a hierarchical model, but in this case we're interested in high-level insight. Our outliers can inform our future thinking about this problem and we should not ignore them forever.
+
+While Stan is an efficient sampler, the model run could take a few minutes or more, depending on your processor.
+
+```{r Stan logistic model, warning=FALSE, message=FALSE, results='hide'}
+logistic_full_ASI<-stan_glm(formula=as.numeric(as.logical(FurSeal_presence))~
+                              Year+Latitude+Week, 
+                            data=dat, 
+                            family=binomial(link="logit"))
+```
+
+With a Bayesian model, our first step should be to look at the posterior chains, to convince ourselves that the model converged. In this case we see good agreement between our 4 chains.
+
+```{r Chain tracing}
+mcmc_trace(logistic_full_ASI, 
+           pars=c("Year", 
+                  "Latitude", 
+                  "Week"))
+```
+
+Once we're convinced, we can have a look at the posteriors
+
+```{r MCMC areas}
+mcmc_areas(x=logistic_full_ASI, 
+           pars=c("Year", 
+                  "Latitude", 
+                  "Week"))
+```
+
+Then we can have a look at the 95% credible intervals to understand our posteriors a little better.
+
+```{r CIs}
+posterior_interval(logistic_full_ASI, 
+                   pars=c("(Intercept)",
+                          "Year", 
+                          "Latitude", 
+                          "Week"), 
+                   prob=0.95)
+```
+
+Then we can look at the posterior estimates directly. Here we see a really small effect of Year, i.e., that as the years go on you're slightly more likely to see a fur seal. Still, the lower bound of the 95% credible interval is nearly 0, so it's not a big effect. Things are clearer for Latitude and for Week. Each have a positive effect.
+
+```{r Model coefficients}
+logistic_full_ASI$coefficients
+```
+
+This all becomes clearer when we visualize each covariate's fit independently:
+
+```{r covariate plots}
+Logi_Year.plot<-dat %>%
+  data_grid(Year=seq_range(Year, by=1),
+            Latitude=seq_range(Latitude, 
+                               n=10), 
+            Week=seq_range(Week,
+                           by=1)) %>%
+  add_fitted_draws(logistic_full_ASI, 
+                   n=100) %>%
+  ggplot(aes(x=Year, 
+             y=as.numeric(as.logical(FurSeal_presence))))+
+  stat_lineribbon(aes(y=.value), 
+                      .width=c(0.8, 
+                               0.95), 
+                  alpha=0.5)+
+  geom_jitter(data=dat, 
+              alpha=0.4, 
+              height=0.01, 
+              aes(color=LatBin))+
+  scale_fill_brewer(palette="Blues",
+                    name="Credible Interval", 
+                    labels=c("95%", "80%"))+
+  scale_color_manual(values=wes_palette("GrandBudapest1",
+                                        4,
+                                        type="discrete")[c(2,3)], 
+                     name="Region", 
+                     labels=c("Northern",
+                              "Southern"))+
+  theme_minimal()+
+  labs(y="Encounter Probability")
+
+Logi_Lat.plot<-dat %>%
+  data_grid(Year=seq_range(Year, 
+                           by=1),
+            Latitude=seq_range(Latitude, 
+                               n=10), 
+            Week=seq_range(Week,
+                           by=1)) %>%
+  add_fitted_draws(logistic_full_ASI, 
+                   n=100) %>%
+  ggplot(aes(x=Latitude, 
+             y=as.numeric(as.logical(FurSeal_presence))))+
+  stat_lineribbon(aes(y=.value), 
+                      .width=c(0.8, 
+                               0.95), 
+                  alpha=0.5)+
+  geom_jitter(data=dat, 
+              alpha=0.4, 
+              height=0.01, 
+              aes(color=LatBin))+
+  scale_fill_brewer(palette="Blues",
+                    name="Credible Interval", 
+                    labels=c("95%", "80%"))+
+  scale_color_manual(values=wes_palette("GrandBudapest1",
+                                        4,
+                                        type="discrete")[c(2,3)], 
+                     name="Region", 
+                     labels=c("Northern","Southern"))+
+  theme_minimal()+
+  labs(y="Encounter Probability")
+
+Logi_Week.plot<-dat %>%
+  data_grid(Year=seq_range(Year, 
+                           by=1),
+            Latitude=seq_range(Latitude,
+                               n=10), 
+            Week=seq_range(Week,
+                           by=1)) %>%
+  add_fitted_draws(logistic_full_ASI, 
+                   n=100) %>%
+  ggplot(aes(x=Week, 
+             y=as.numeric(as.logical(FurSeal_presence))))+
+  stat_lineribbon(aes(y=.value), 
+                      .width=c(0.8, 
+                               0.95), 
+                  alpha=0.5)+
+  geom_jitter(data=dat, 
+              alpha=0.4, 
+              height=0.01, 
+              aes(color=LatBin))+
+  scale_fill_brewer(palette="Blues",
+                    name="Credible Interval", 
+                    labels=c("95%", "80%"))+
+  scale_color_manual(values=wes_palette("GrandBudapest1",
+                                        4,
+                                        type="discrete")[c(2,3)], 
+                     name="Region", 
+                     labels=c("Northern","Southern"))+
+  theme_minimal()+
+  labs(y="Encounter Probability")
+```
+
+We make our plots, then we can combine them together. Here, northern sites are in red, southern sites are in brown.
+
+```{r combine plots}
+# shared legend as separate plot
+Logi_legend.plot<-g_legend(Logi_Lat.plot)
+
+# Arrange plots and legend
+grid.arrange(arrangeGrob(Logi_Year.plot + 
+                           theme(legend.position="none") + 
+                           labs(y=""),
+                         Logi_Lat.plot  + 
+                           theme(legend.position="none"),
+                         Logi_Week.plot + 
+                           theme(legend.position="none") + 
+                           labs(y=""),
+                         nrow=3))#,
+             #Logi_legend.plot, ncol=2,heights=c(10, 1))
+
+```
+
+We'll repeat the procedure with our community science data - flickr and iNaturalist. 
+
+First though, let's take a look at the data. ASI data starts in the early 90s, and so does the iNaturalist data. 
+iNaturalist only started in 2009 though, so those are observations that were uploaded later. There's a concern there
+that they would be biased toward a particular region or time, if one or a few Antarctic researchers decided to upload their photos
+rather than an approximately random assortment of observations. Let's take a look
+
+```{r Flickr iNat bias}
+## Is there a spatial bias in early iNat records?
+## We can look to see where they're coming from - the aren't coming from very far south.
+## Perhaps it's wisest to remove and only work with data that's more current.
+## Looking at users, there does 
+
+inat_LatTime_bias.plot<-ggplot(data=all_inat)+
+  geom_point(aes(x=ymd(substr(all_inat$eventDate,1,10)), y=decimalLatitude, color=family))+
+  #geom_point(data=all_inat[all_inat$year<2008,],aes(x=ymd(substr(eventDate,1,10)), y=decimalLatitude, color=rightsHolder))+
+  geom_point(data=all_inat[all_inat$genus=="Arctocephalus",],aes(x=ymd(substr(eventDate,1,10)), y=decimalLatitude), color="black", size=3)+
+  #geom_point(data=all_inat[all_inat$genus=="Arctocephalus",],aes(x=ymd(substr(eventDate,1,10)), y=decimalLatitude, color=rightsHolder), size=3, alpha=0.5)+
+  theme_minimal()+theme(legend.position = "none")+
+  labs(x="Year", y="Latitude")+ggtitle("Dist. of iNat obs. Color=Family, Black=Fur Seal")
+
+## Looking at users, there does appear to be a super user during that time, who clearly uploaded a whole cache of photos - someone who works there
+inat_userTime_bias.plot<-ggplot(data=all_inat[all_inat$year<2008,])+
+  geom_bar(aes(x=reorder(User, User, FUN=function(x)-length(x))))+
+  theme_minimal()+labs(x="User", y="Number of Uploads From Before 2009")+
+  theme(axis.text.x = element_text(angle = 90))#+
+  scale_y_log10()
+inat_userTime_bias.plot
+
+grid.arrange(inat_LatTime_bias.plot, inat_userTime_bias.plot, ncol=2)
+
+```
+
+Sure enough, we see that most pre-2009 observations come from one user. We'll simply exclude that time period here.
+
+I'll run the model and plotting in one go for convenience, since it's an identical procedure to that above. The one difference is that we're excluding year here. Given that usership on both platforms has increased over time, year is unreliable without also creating a detection or effort model.
+
+```{r, Logistic CitSci Stan, warning=FALSE, message=FALSE, results='hide', echo=FALSE}
+
+# Now the model - notice year is not present in the model. Given the increase in usership, any year effect would likely be driven by 
+# Effort, rather than reality
+
+# Here commenting out the interx model 
+logistic_full_CitSci.stan<-stan_glm(formula=FurSeal_presence~Latitude+Week, 
+                                    data=citsci.dat, 
+                                    family=binomial(link="logit"))
+```
+
+```{r Logistic CitSci Stan - plots, warning=FALSE, message=FALSE, echo=FALSE}
+
+## Model coefficients and 95% Credible Intervals:
+posterior_interval(logistic_full_CitSci.stan, pars=c("(Intercept)", 
+                                                     "Latitude", 
+                                                     "Week"), 
+                   prob=0.95)
+logistic_full_CitSci.stan$coefficients
+
+logi_all_area.plot<-mcmc_areas(x=logistic_full_CitSci.stan, 
+                               pars=c("Latitude", 
+                                      "Week"), 
+                               prob=0.80, 
+                               prob_outer=0.95)
+logi_lat_area.plot<-mcmc_areas(x=logistic_full_CitSci.stan, 
+                               pars=c("Latitude"))
+logi_week_area.plot<-mcmc_areas(x=logistic_full_CitSci.stan, 
+                                pars=c("Week"))
+#logi_latxweek_area.plot<-mcmc_areas(x=logistic_full_CitSci.stan, pars=c("Latitude:Week"))
+# Now arrange the posterior plots together
+grid.arrange(logi_all_area.plot,
+             logi_lat_area.plot, 
+             logi_week_area.plot, 
+             layout_matrix=rbind(c(1,2),
+                                 c(1,3)))
+
+
+mcmc_trace(logistic_full_CitSci.stan, 
+           pars=c("Latitude", 
+                  "Week"))
+
+Logi_Lat.plot<-citsci.dat %>%
+  data_grid(Latitude=seq_range(Latitude, 
+                               n=10), 
+            Week=seq_range(Week,
+                           by=1)) %>%
+  add_fitted_draws(logistic_full_CitSci.stan, 
+                   n=100) %>%
+  ggplot(aes(x=Latitude, 
+             y=as.numeric(as.logical(FurSeal_presence))))+
+  stat_lineribbon(aes(y=.value), 
+                  .width=c(0.8, 
+                           0.95), 
+                  alpha=0.5)+
+  geom_jitter(data=citsci.dat, 
+              alpha=0.4, 
+              height=0.01, 
+              aes(color=LatBin))+
+  scale_fill_brewer(palette="Blues",
+                    name="Credible Interval", 
+                    labels=c("95%", "80%"))+
+  scale_color_manual(values=wes_palette("GrandBudapest1",
+                                        4,
+                                        type="discrete")[c(2,3)], 
+                     name="Region", 
+                     labels=c("Northern",
+                              "Southern"))+
+  theme_minimal()+
+  labs(y="Encounter Probability")
+
+Logi_Week.plot<-citsci.dat %>%
+  data_grid(Latitude=seq_range(Latitude, 
+                               n=10), 
+            Week=seq_range(Week,
+                           by=1)) %>%
+  add_fitted_draws(logistic_full_CitSci.stan, 
+                   n=100) %>%
+  ggplot(aes(x=Week, 
+             y=as.numeric(as.logical(FurSeal_presence))))+
+  stat_lineribbon(aes(y=.value), 
+                  .width=c(0.8, 
+                           0.95), 
+                  alpha=0.5)+
+  geom_jitter(data=citsci.dat, 
+              alpha=0.4, 
+              height=0.01, 
+              aes(color=LatBin))+
+  scale_fill_brewer(palette="Blues",
+                    name="Credible Interval", 
+                    labels=c("95%", "80%"))+
+  scale_color_manual(values=wes_palette("GrandBudapest1",
+                                        4,
+                                        type="discrete")[c(2,3)], 
+                     name="Region", 
+                     labels=c("Northern",
+                              "Southern"))+
+  theme_minimal()+
+  labs(y="Encounter Probability")
+
+Logi_legend.plot<-g_legend(Logi_Lat.plot)
+
+# Arrange plots and legend
+grid.arrange(arrangeGrob(Logi_Lat.plot  + 
+                           theme(legend.position="none"),
+                         Logi_Week.plot + 
+                           theme(legend.position="none") + 
+                           labs(y=""),
+                         nrow=2),
+             Logi_legend.plot, 
+             ncol=2,
+             heights=c(10, 1))
+
+```
+
+When we compare with our results from the ASI, we find broadly similar patterns. While there are a variety of biases and confounding factors present in the social media data, what I've demonstrated here is that such data can be useful even in demonstrating broad patterns even in Antarctica. More work remains to model detection and understand how tourist behavior can influence the data. 
+Do tourists get bored of seals and stop photographing them? This could be a problem since most tourists start in the north before heading south. 
+If there are cuter species nearby, will tourists avoid photographing fur seals? This could lead to underrepresentation of areas that have high productivity and attract a lot of species.
+
+A much more complex, hierarchical model would be needed to fuse these different datasets into one quantitative framework. This is feasible, but likely will require collaborations with folks like sociologists, who can help model tourist behavior.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
